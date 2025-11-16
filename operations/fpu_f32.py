@@ -254,9 +254,214 @@ def fmul_f32(a_bits: Bits, b_bits: Bits) -> Dict[str, object]:
     for k in flags: flags[k] = (flags_r.get(k,0) or flags_pack.get(k,0))
     return {"res_bits": out_bits, "flags": flags, "trace": trace}
 
-# stubs (to implement next)
-def fadd_f32(a_bits: Bits, b_bits: Bits):
-    raise NotImplementedError
+# ---------- helpers specifically for add/sub ----------
 
-def fsub_f32(a_bits: Bits, b_bits: Bits):
-    raise NotImplementedError
+def _u_ge(a: Bits, b: Bits) -> int:
+    """Unsigned >= comparison (same width), MSB..LSB."""
+    for i in range(len(a)):
+        if a[i] != b[i]:
+            return 1 if a[i] > b[i] else 0
+    return 1  # equal
+
+def _sticky_srl_once(bits: Bits, sticky_in: int) -> Tuple[Bits, int]:
+    """Logical SRL by 1, returning (shifted, sticky_out). sticky_out |= dropped LSB."""
+    dropped = bits[-1]
+    out = shifter(bits, 1, "SRL")
+    sticky_out = 1 if (sticky_in == 1 or dropped == 1) else 0
+    return out, sticky_out
+
+def _align_to_same_exp(sig_big27: Bits, sig_sml27: Bits, e_big8: Bits, e_sml8: Bits) -> Tuple[Bits, Bits, int]:
+    """
+    Right-shift the smaller 27-bit significand by (e_big - e_sml) with sticky aggregation.
+    Precond: e_big8 >= e_sml8 (unsigned compare).
+    Returns (big27, sml27_aligned, sticky_on_sml).
+    """
+    big = sig_big27[:]
+    sml = sig_sml27[:]
+
+    # compute delta = e_big - e_sml (as 9-bit unsigned) using our adder/sub
+    EL9 = [0] + e_big8
+    ES9 = [0] + e_sml8
+    delta9, _ = _sub9(EL9, ES9)
+
+    sticky = 0
+    # shift sml right 'delta' times; each SRL aggregates sticky
+    # cap to 64 to be safe (beyond 27+ a few, value collapses anyway)
+    for _ in range(64):
+        if _all_zero(delta9):
+            break
+        sml, sticky = _sticky_srl_once(sml, sticky)
+        delta9, _ = _sub9(delta9, _ONE9)
+
+    # ensure the final sticky is recorded in the LSB position
+    if sticky == 1:
+        sml = sml[:-1] + [1]
+
+    return big, sml, sticky
+
+def _leading1_index(bits: Bits) -> int:
+    for i, b in enumerate(bits):
+        if b == 1:
+            return i
+    return -1
+
+def _round_rne_from_any(p: Bits, exp9: Bits) -> Tuple[Bits, Bits, Dict[str,int]]:
+    """
+    Normalize arbitrary-width positive p (MSB..LSB), then round to 24-bit mantissa (hidden+23) with RNE.
+    Returns (mant24, exp9_after, flags_delta).
+    """
+    flags = {"overflow":0, "underflow":0, "invalid":0}
+    e = exp9
+    q = p[:]
+
+    lead = _leading1_index(q)
+    if lead == -1:
+        # zero
+        return [0]*24, e, flags
+
+    if lead == 0:
+        # value in [2,4): keep window at 0.., bump exponent
+        e, _ = _add9(e, _ONE9)
+        start = 0
+    elif lead > 1:
+        # need to left-normalize so the hidden 1 ends up at index 1
+        shifts = lead - 1
+        for _ in range(shifts):
+            q = shifter(q, 1, "SLL")
+            e, _ = _sub9(e, _ONE9)
+        start = 1
+    else:
+        # lead == 1, already [1,2)
+        start = 1
+
+    # Mantissa window and GRS immediately after it
+    end = start + 24
+    mant24 = q[start:end]
+    if len(mant24) < 24:
+        mant24 = mant24 + [0]*(24 - len(mant24))
+    g = q[end]   if end   < len(q) else 0
+    r = q[end+1] if end+1 < len(q) else 0
+    s = _or_reduce(q[end+2:]) if end+2 < len(q) else 0
+
+    lsb = mant24[-1]
+    inc = 1 if (g == 1 and (r == 1 or s == 1 or lsb == 1)) else 0
+    if inc:
+        mant24, carry = _inc_u(mant24)
+        if carry == 1:
+            mant24 = [1] + mant24[:-1]
+            e, _ = _add9(e, _ONE9)
+
+    return mant24, e, flags
+
+def _is_zero_sig(sig24: Bits) -> int:
+    return 1 if _all_zero(sig24) else 0
+
+# ---------- main: fadd_f32 / fsub_f32 ----------
+
+def fadd_f32(a_bits: Bits, b_bits: Bits) -> Dict[str, object]:
+    """
+    IEEE-754 add with RoundTiesToEven:
+      - specials (NaN/Inf/±0)
+      - align smaller significand with sticky
+      - add/sub based on signs and magnitude
+      - normalize + RNE
+    Returns {res_bits, flags, trace}
+    """
+    trace = []
+    sa, ea, fa = unpack_f32_fields(a_bits)
+    sb, eb, fb = unpack_f32_fields(b_bits)
+    ka = classify_f32(a_bits)
+    kb = classify_f32(b_bits)
+
+    # NaN propagation
+    if ka["kind"] == "NAN":  # qNaN in, return it
+        return {"res_bits": a_bits, "flags": {"overflow":0,"underflow":0,"invalid":1}, "trace": ["nan_a"]}
+    if kb["kind"] == "NAN":
+        return {"res_bits": b_bits, "flags": {"overflow":0,"underflow":0,"invalid":1}, "trace": ["nan_b"]}
+
+    # Infinity rules
+    if ka["kind"] == "INF" and kb["kind"] == "INF":
+        if sa == sb:
+            return {"res_bits": [sa] + [1]*8 + [0]*23, "flags": {"overflow":0,"underflow":0,"invalid":0}, "trace": ["inf+inf"]}
+        # +Inf + -Inf => invalid NaN
+        qnan = [0] + [1]*8 + ([0]*22 + [1])
+        return {"res_bits": qnan, "flags": {"overflow":0,"underflow":0,"invalid":1}, "trace": ["inf+-inf"]}
+    if ka["kind"] == "INF":
+        return {"res_bits": [sa] + [1]*8 + [0]*23, "flags": {"overflow":0,"underflow":0,"invalid":0}, "trace": ["inf+finite"]}
+    if kb["kind"] == "INF":
+        return {"res_bits": [sb] + [1]*8 + [0]*23, "flags": {"overflow":0,"underflow":0,"invalid":0}, "trace": ["finite+inf"]}
+
+    # Zeros: if both zero (any signs) → +0 (per usual default)
+    if ka["kind"] == "ZERO" and kb["kind"] == "ZERO":
+        return {"res_bits": [0] + [0]*8 + [0]*23, "flags": {"overflow":0,"underflow":0,"invalid":0}, "trace": ["zero+zero"]}
+    # If one is zero, return the other
+    if ka["kind"] == "ZERO":
+        return {"res_bits": [sb] + eb + fb, "flags": {"overflow":0,"underflow":0,"invalid":0}, "trace": ["0+x"]}
+    if kb["kind"] == "ZERO":
+        return {"res_bits": [sa] + ea + fa, "flags": {"overflow":0,"underflow":0,"invalid":0}, "trace": ["x+0"]}
+
+    # Build effective exponents and 24-bit significands
+    # For normals: hidden=1; for subnormals: hidden=0; effective exponent is 1 for subnormals.
+    eA_eff8 = _exp_effective(ea)
+    eB_eff8 = _exp_effective(eb)
+    sigA24  = _make_significand(ea, fa)   # 24
+    sigB24  = _make_significand(eb, fb)   # 24
+
+    # Decide which has larger magnitude (exp, then significand)
+    if _u_ge(eA_eff8, eB_eff8):
+        eL8, eS8 = eA_eff8, eB_eff8
+        sigL24, sigS24 = sigA24, sigB24
+        sL, sS = sa, sb
+    else:
+        eL8, eS8 = eB_eff8, eA_eff8
+        sigL24, sigS24 = sigB24, sigA24
+        sL, sS = sb, sa
+
+    # Prepare 27-bit (mantissa<<3) so the last 3 bits become G/R/S after alignment
+    sigL27 = sigL24 + [0,0,0]
+    sigS27 = sigS24 + [0,0,0]
+
+    # Align smaller to larger exponent with sticky aggregation
+    sigL27, sigS27_aligned, _sticky = _align_to_same_exp(sigL27, sigS27, eL8, eS8)
+    # Use UNBIASED exponent frame: exp_true9 = eL8 - bias
+    EL9 = [0] + eL8
+    neg_bias9 = twos_complement_negate(_BIAS9)
+    exp_true9, _ = _add9(EL9, neg_bias9)
+
+
+    # Determine operation (add vs subtract) in significand space
+    # If signs equal -> add magnitudes; else subtract smaller mag from larger mag, sign=result sign of larger magnitude.
+    if sL == sS:
+        # Unsigned add in 28 bits to catch carry-out
+        p28_L = [0] + sigL27
+        p28_S = [0] + sigS27_aligned
+        sum28, _ = _add_u(p28_L, p28_S)
+        # Normalize + RNE from variable-width
+        mant24, exp_after, flags_r = _round_rne_from_any(sum28, exp_true9)
+        sign_res = sL
+    else:
+        # Subtract: |L| - |S|
+        # If magnitudes equal after alignment, result is +0
+        if sigL27 == sigS27_aligned:
+            return {"res_bits": [0] + [0]*8 + [0]*23, "flags": {"overflow":0,"underflow":0,"invalid":0}, "trace": ["cancel_to_zero"]}
+        p28_L = [0] + sigL27
+        # twos-complement negate of smaller (28-bit)
+        p28_S = [0] + sigS27_aligned
+        neg_S  = twos_complement_negate(p28_S)
+        diff28, _ = _add_u(p28_L, neg_S)
+        mant24, exp_after, flags_r = _round_rne_from_any(diff28, exp_true9)
+        sign_res = sL
+
+    # Pack + merge flags
+    out_bits, flags_pack = _pack_from_mant_exp(sign_res, mant24, exp_after)
+    flags = {"overflow":0,"underflow":0,"invalid":0}
+    for k in flags: flags[k] = (flags_r.get(k,0) or flags_pack.get(k,0))
+    return {"res_bits": out_bits, "flags": flags, "trace": trace}
+
+def fsub_f32(a_bits: Bits, b_bits: Bits) -> Dict[str, object]:
+    """a - b implemented as a + (-b), with specials handled in fadd_f32."""
+    sb, eb, fb = unpack_f32_fields(b_bits)
+    # Flip sign of b (careful: NaN payload preserved; fadd handles NaN early)
+    b_neg = [1 - sb] + eb + fb
+    return fadd_f32(a_bits, b_neg)
+
